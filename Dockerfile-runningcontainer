@@ -1,0 +1,8 @@
+From ubuntu:18.04
+# docker file to install python3
+RUN apt update && \
+ apt -y install software-properties-common && \
+ add-apt-repository ppa:deadsnakes/ppa -y && \
+ apt install python3.7 -y
+# below tail command is used to keep the container running
+CMD tail -f /dev/null
