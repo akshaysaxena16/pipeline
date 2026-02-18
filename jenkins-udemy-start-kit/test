@@ -1,0 +1,1 @@
+aws stepfunctions list-state-machines --region "$AWS_REGION" --query "stateMachines[?name=='dummy-cert-test'].stateMachineArn | [0]" --output text
