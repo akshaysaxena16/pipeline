@@ -1,3 +1,4 @@
+stepfunctions/workflows/dummy-ecs-run-task/cert-artifacts.json
 {
   "comment": "Dummy artifacts for cert flow demonstration",
   "tasks": [
