@@ -1,77 +1,78 @@
-One-liner
+STEP FUNCTIONS CI/CD — COPY/PASTE SUMMARY (PLAIN TEXT)
+ONE-LINER
 Developers define Step Functions as folders in git; GitHub Actions validates on PR and deploys to AWS on merge to cert (or prod), only for workflows that changed.
 
-How a developer ships to cert
-Add or edit stepfunctions/workflows/<workflow-id>/ (required: definition.asl.json).
-Use env-specific files when possible: cert-trigger.json, cert-input.json, cert-s3copy.json, cert-artifacts.json.
-Put shared values (cluster ARNs, S3 URIs, roles) in stepfunctions/env/cert.json and reference them as ${KEY} in ASL and JSON configs.
-Open a PR → validate runs (JSON, rendering for cert + prod, trigger/S3/artifacts rules).
-Merge to cert → deploy-cert runs automatically for changed folders only.
-Optional: Actions → Run workflow with deploy=cert, mode=changed|all for manual redeploy.
-What each deploy can do
-Capability	Config file	AWS result
-State machine
-definition.asl.json
-Create/update Step Function
-Schedule / events
-cert-trigger.json + cert-input.json
-EventBridge rule → StartExecution
-S3 file copy
+HOW A DEVELOPER SHIPS TO CERT
+Add or edit: stepfunctions/workflows// (required: definition.asl.json)
+
+Prefer env-specific files:
+
+cert-trigger.json
+cert-input.json
 cert-s3copy.json
-Copy listed objects between buckets
-Build & upload
 cert-artifacts.json
-tar.gz from SQL path or direct file copy to S3
-Deploy is hash-aware (state in S3): unchanged definition/trigger/s3copy/artifacts are skipped. Change "comment" in JSON to force a rerun.
+Put shared values in: stepfunctions/env/cert.json Reference in ASL/JSON as: ${KEY} (cluster ARNs, S3 URIs, roles, etc.)
 
-Naming tip
-Folder dummy-ecs-**env**-run-task becomes state machine dummy-ecs-**cert**-run-task in cert (same pattern for prod).
+Open a PR --> validate job runs (JSON, rendering for cert + prod, trigger/S3/artifacts rules)
 
+Merge to cert --> deploy-cert runs automatically (changed workflow folders only)
 
-Why env-specific trigger and input files?
-The pipeline resolves config in this order:
+Optional manual redeploy: Actions --> stepfunctions-cicd --> Run workflow
 
-cert-trigger.json / prod-trigger.json (preferred)
-trigger.json (fallback if no env file)
-Same pattern for cert-input.json / prod-input.json vs input.json.
+deploy = cert
+mode = changed | all
+WHAT EACH DEPLOY CAN DO
++----------------------------+---------------------------+----------------------------------+ | Capability | Config file | AWS result | +----------------------------+---------------------------+----------------------------------+ | State machine | definition.asl.json | Create/update Step Function | | Schedule / events | cert-trigger.json | EventBridge rule --> | | | + cert-input.json | StartExecution | | S3 file copy | cert-s3copy.json | Copy listed objects between | | | | buckets | | Build & upload | cert-artifacts.json | tar.gz from SQL path OR direct | | | | file copy to S3 | +----------------------------+---------------------------+----------------------------------+
 
-That split exists for practical and safety reasons, not just naming.
+Deploy is hash-aware (state stored in S3):
 
-1. Cert and prod usually need different behavior
-Trigger controls when and how the state machine is started (EventBridge schedule, rule state, target role, tags).
+Unchanged definition / trigger / s3copy / artifacts are skipped.
+Change the "comment" field in JSON to force a rerun.
+NAMING TIP
+Folder name: dummy-ecs-env-run-task Cert deploy: dummy-ecs-cert-run-task (state machine) dummy-ecs-cert-run-task-trigger (EventBridge rule)
 
-Input is the JSON payload passed into StartExecution when the rule fires.
+Pattern: replace "-env-" with "-cert-" or "-prod-" at deploy time.
 
-Those concerns often differ by environment:
+WHY ENV-SPECIFIC TRIGGER AND INPUT FILES?
+Resolution order:
 
-Concern	Cert	Prod
-Schedule
-Frequent or manual-friendly (e.g. every 30 min for testing)
-Stricter cadence (e.g. monthly, business hours only)
-Rule state
-ENABLED for integration tests
-Same schedule but different description/target id
-Event pattern
-Test queues/topics
-Production event sources
-Input payload
-Test buckets, paths, cadence: adhoc, smaller date windows
-Production buckets, paths, stricter timeouts
-stepfunctions/env/cert.json and prod.json already separate infrastructure (cluster ARNs, IAM roles, S3 base URIs). Trigger and input carry job runtime settings (bucket names in the execution payload, ETL paths, report subjects). Those are often not simple ${KEY} swaps—structure or fields can differ per env.
+Trigger: cert-trigger.json / prod-trigger.json (preferred) trigger.json (fallback)
 
-2. Avoid cross-environment mistakes
-A single shared trigger.json means:
+Input: cert-input.json / prod-input.json (preferred) input.json (fallback)
 
-Changing the schedule for cert testing also changes what would deploy to prod on the next prod merge.
-Easy to enable a aggressive schedule in cert and accidentally ship it to prod in the same commit.
-Separate files make the intent explicit: editing cert-trigger.json only affects cert deploy; prod keeps its own file until you change prod-trigger.json.
+That split is for practical and safety reasons, not just naming.
 
-3. Independent deploy and state tracking
-Deploy hashes trigger + input together per environment. With env-specific files:
+FILE ROLES
+stepfunctions/env/cert.json --> Infrastructure (ARNs, roles, S3 prefixes) cert-trigger.json --> When/how to run (schedule, EventBridge) cert-input.json --> Payload for StartExecution definition.asl.json --> State machine logic
 
-A cert-only trigger/input change updates cert EventBridge and cert state in S3.
-Prod is unchanged until prod-trigger.json / prod-input.json change.
-That matches how the pipeline deploys: merge to cert runs deploy-cert and reads cert files only; merge to prod reads prod files.
+CERT AND PROD USUALLY NEED DIFFERENT BEHAVIOR
+Trigger = when/how the state machine starts (EventBridge schedule, rule state, target role, tags)
 
+Input = JSON payload passed to StartExecution when the rule fires
 
++---------------+--------------------------------+--------------------------------+ | Concern | Cert | Prod | +---------------+--------------------------------+--------------------------------+ | Schedule | Frequent / test-friendly | Stricter cadence | | | (e.g. every 30 min) | (e.g. monthly, business hours) | | Rule state | ENABLED for integration | May differ (description, | | | tests | target id) | | Event pattern | Test queues/topics | Production event sources | | Input payload | Test buckets/paths, | Production buckets/paths, | | | cadence: adhoc, smaller windows| stricter timeouts | +---------------+--------------------------------+--------------------------------+
 
+env/cert.json and env/prod.json = infrastructure (clusters, IAM, S3 bases) trigger + input files = job runtime settings (ETL paths, buckets, report subjects)
+
+Those are often NOT simple ${KEY} swaps -- structure or fields can differ per env.
+
+AVOID CROSS-ENVIRONMENT MISTAKES
+Single shared trigger.json means:
+
+A cert schedule change also deploys to prod on the next prod merge.
+An aggressive cert test schedule can ship to prod in the same commit.
+Separate files make intent explicit:
+
+Edit cert-trigger.json --> cert deploy only
+Edit prod-trigger.json --> prod deploy only
+INDEPENDENT DEPLOY AND STATE TRACKING
+Deploy hashes trigger + input together per environment.
+
+Cert-only trigger/input change --> updates cert EventBridge + cert S3 state
+Prod unchanged until prod-trigger.json / prod-input.json change
+Pipeline behavior:
+
+Merge to cert --> deploy-cert --> reads cert-* files only
+Merge to prod --> deploy-prod --> reads prod-* files only
+WHEN FALLBACK FILES ARE OK
+Use shared trigger.json and input.json when behavior is identical across environments and all differences come from ${KEY} in stepfunctions/env/.json
