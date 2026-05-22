@@ -1,1 +1,59 @@
 
+1. Create the GitHub OIDC provider in the same account as the role
+Run in the account where the role lives (replace profile/region as needed):
+
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+Console: IAM → Identity providers → Add provider → OpenID Connect
+
+Provider URL: https://token.actions.githubusercontent.com
+Audience: sts.amazonaws.com
+Check it exists:
+
+aws iam list-open-id-connect-providers
+You should see something like:
+
+arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com
+
+2. Confirm the role trusts that provider (not a user)
+Role Trust relationships must include:
+
+Principal:
+arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com
+Action: sts:AssumeRoleWithWebIdentity
+Condition on sub (repo) and aud (audience)
+Example:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:ORG/REPO:*"
+        }
+      }
+    }
+  ]
+}
+Use the exact org/repo (and branch/environment if you restrict further).
+
+3. Align workflow with OIDC requirements
+permissions:
+  id-token: write
+  contents: read
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::ACCOUNT_ID:role/YOUR_ROLE_NAME
+    aws-region: us-east-1
+role-to-assume must be in the same account where you created the OIDC provider (unless you use role chaining — see below).
+No long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY needed for OIDC.
