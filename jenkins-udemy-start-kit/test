@@ -1,1 +1,379 @@
-aws stepfunctions list-state-machines --region "$AWS_REGION" --query "stateMachines[?name=='dummy-cert-test'].stateMachineArn | [0]" --output text
+name: stepfunctions-cicd
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: ["cert", "prod", "main"]
+    paths:
+      - "stepfunctions/**"
+      - "scripts/**"
+      - ".github/workflows/stepfunctions-cicd.yml"
+  push:
+    branches: ["cert", "prod"]
+    paths:
+      - "stepfunctions/**"
+      - "scripts/**"
+      - ".github/workflows/stepfunctions-cicd.yml"
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - cert
+          - prod
+      mode:
+        description: "Deploy mode"
+        required: true
+        type: choice
+        options:
+          - changed
+          - all
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate workflow bundle JSON files
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/materialize_render_env.sh scripts/validate_workflow_bundles.sh
+
+          WORKFLOW_DIRS="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+          if [[ -z "${WORKFLOW_DIRS//[[:space:]]/}" ]]; then
+            echo "No workflow bundles found under stepfunctions/workflows"
+            exit 0
+          fi
+
+          while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            req="$d/definition.asl.json"
+            [[ -f "$req" ]] || { echo "Missing required file: $req" >&2; exit 1; }
+
+            for optional in \
+              "$d/cert-trigger.json" \
+              "$d/prod-trigger.json" \
+              "$d/input.json" \
+              "$d/s3copy.json" \
+              "$d/artifacts.json"; do
+              if [[ -f "$optional" ]]; then
+                jq -e . "$optional" >/dev/null
+              fi
+            done
+          done <<< "$WORKFLOW_DIRS"
+
+      - name: Materialize render env (cert) from repository secret
+        env:
+          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_CERT }}
+        run: scripts/materialize_render_env.sh cert
+
+      - name: Validate rendered bundles (cert)
+        env:
+          SFN_RENDER_ENV_FILE: /tmp/sfn-render-env-cert.json
+        run: scripts/validate_workflow_bundles.sh cert
+
+      - name: Materialize render env (prod) from repository secret
+        env:
+          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_PROD }}
+        run: scripts/materialize_render_env.sh prod
+
+      - name: Validate rendered bundles (prod)
+        env:
+          SFN_RENDER_ENV_FILE: /tmp/sfn-render-env-prod.json
+        run: scripts/validate_workflow_bundles.sh prod
+
+  deploy-cert:
+    # Cert deploy runs automatically on push to cert and manually via workflow_dispatch.
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == 'cert') ||
+      (github.event_name == 'push' && github.ref_name == 'cert')
+    needs: [validate]
+    runs-on: ubuntu-latest
+    environment: cert
+    concurrency:
+      group: stepfunctions-cert
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (cert)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Materialize render env (cert) from repository secret
+        env:
+          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_CERT }}
+        run: |
+          chmod +x scripts/materialize_render_env.sh
+          scripts/materialize_render_env.sh cert
+
+      - name: Determine deploy + delete changes (cert)
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.mode }}" == "all" ]]; then
+            DEPLOY_LIST="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+            DELETE_LIST=""
+          else
+            HEAD_SHA="${{ github.sha }}"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              BASE_SHA=""
+
+              # For manual changed mode, diff from last successful deployment checkpoint.
+              if [[ "${{ inputs.mode }}" == "changed" ]]; then
+                STATE_TMP="$(mktemp)"
+                LAST_DEPLOYED_SHA=""
+                if aws s3 cp "${{ secrets.SFN_STATE_FILE_S3_URI_CERT }}" "$STATE_TMP" --region "${{ secrets.AWS_REGION }}" >/dev/null 2>&1; then
+                  LAST_DEPLOYED_SHA="$(jq -r '.lastSuccessfulCommit // empty' "$STATE_TMP" 2>/dev/null || true)"
+                fi
+                rm -f "$STATE_TMP"
+
+                if [[ -n "$LAST_DEPLOYED_SHA" ]] && git cat-file -e "${LAST_DEPLOYED_SHA}^{commit}" >/dev/null 2>&1; then
+                  BASE_SHA="$LAST_DEPLOYED_SHA"
+                fi
+              fi
+
+              # Fallback when no checkpoint exists yet.
+              if [[ -z "$BASE_SHA" ]]; then
+                if git rev-parse "${HEAD_SHA}^" >/dev/null 2>&1; then
+                  BASE_SHA="$(git rev-parse "${HEAD_SHA}^")"
+                else
+                  # No parent commit (e.g. first commit on branch) => treat as full deploy.
+                  BASE_SHA=""
+                fi
+              fi
+            else
+              BASE_SHA="${{ github.event.before }}"
+            fi
+
+            if [[ -z "${BASE_SHA}" ]]; then
+              DEPLOY_LIST="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+              DELETE_LIST=""
+            else
+              RAW="$(scripts/detect_stepfunctions_changes.sh "$BASE_SHA" "$HEAD_SHA" || true)"
+              DEPLOY_LIST="$(echo "$RAW" | awk -F: '$1=="DEPLOY"{print $2}' | sed '/^\s*$/d' || true)"
+              DELETE_LIST="$(echo "$RAW" | awk -F: '$1=="DELETE"{print $2}' | sed '/^\s*$/d' || true)"
+            fi
+          fi
+
+          echo "Deploy definitions:"
+          echo "$DEPLOY_LIST"
+          echo
+          echo "Delete workflow ids:"
+          echo "$DELETE_LIST"
+
+          {
+            echo "deploy<<EOF"
+            echo "$DEPLOY_LIST"
+            echo "EOF"
+            echo "delete<<EOF"
+            echo "$DELETE_LIST"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy changed workflows to cert
+        if: ${{ steps.changes.outputs.deploy != '' }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_EXECUTION_ROLE_ARN: ${{ secrets.SFN_EXECUTION_ROLE_ARN_CERT }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_CERT }}
+          SFN_RENDER_ENV_FILE: /tmp/sfn-render-env-cert.json
+          EVENTBRIDGE_EVENT_BUS_NAME: "default"
+          ENV_NAME: cert
+        run: |
+          set -euo pipefail
+          chmod +x scripts/deploy_sfn.sh scripts/detect_stepfunctions_changes.sh scripts/delete_sfn.sh
+          while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            scripts/deploy_sfn.sh "$ENV_NAME" "$d"
+          done <<< "${{ steps.changes.outputs.deploy }}"
+
+      - name: Delete removed workflows in cert
+        if: ${{ steps.changes.outputs.delete != '' }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_CERT }}
+          EVENTBRIDGE_EVENT_BUS_NAME: "default"
+          ENV_NAME: cert
+        run: |
+          set -euo pipefail
+          chmod +x scripts/delete_sfn.sh
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            scripts/delete_sfn.sh "$ENV_NAME" "$id"
+          done <<< "${{ steps.changes.outputs.delete }}"
+
+      - name: Update deploy checkpoint (cert)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_CERT }}
+          ENV_NAME: cert
+          DEPLOY_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/update_sfn_state_checkpoint.sh
+          scripts/update_sfn_state_checkpoint.sh "$ENV_NAME" "$DEPLOY_COMMIT"
+
+  deploy-prod:
+    # Prod is gated by GitHub Environment approvals (configure in repo settings).
+    # Prod deploy runs automatically on push to prod and manually via workflow_dispatch.
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == 'prod') ||
+      (github.event_name == 'push' && github.ref_name == 'prod')
+    needs: [validate]
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: stepfunctions-prod
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Materialize render env (prod) from repository secret
+        env:
+          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_PROD }}
+        run: |
+          chmod +x scripts/materialize_render_env.sh
+          scripts/materialize_render_env.sh prod
+
+      - name: Determine deploy + delete changes (prod)
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.mode }}" == "all" ]]; then
+            DEPLOY_LIST="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+            DELETE_LIST=""
+          else
+            HEAD_SHA="${{ github.sha }}"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              BASE_SHA=""
+
+              # For manual changed mode, diff from last successful deployment checkpoint.
+              if [[ "${{ inputs.mode }}" == "changed" ]]; then
+                STATE_TMP="$(mktemp)"
+                LAST_DEPLOYED_SHA=""
+                if aws s3 cp "${{ secrets.SFN_STATE_FILE_S3_URI_PROD }}" "$STATE_TMP" --region "${{ secrets.AWS_REGION }}" >/dev/null 2>&1; then
+                  LAST_DEPLOYED_SHA="$(jq -r '.lastSuccessfulCommit // empty' "$STATE_TMP" 2>/dev/null || true)"
+                fi
+                rm -f "$STATE_TMP"
+
+                if [[ -n "$LAST_DEPLOYED_SHA" ]] && git cat-file -e "${LAST_DEPLOYED_SHA}^{commit}" >/dev/null 2>&1; then
+                  BASE_SHA="$LAST_DEPLOYED_SHA"
+                fi
+              fi
+
+              # Fallback when no checkpoint exists yet.
+              if [[ -z "$BASE_SHA" ]]; then
+                if git rev-parse "${HEAD_SHA}^" >/dev/null 2>&1; then
+                  BASE_SHA="$(git rev-parse "${HEAD_SHA}^")"
+                else
+                  # No parent commit (e.g. first commit on branch) => treat as full deploy.
+                  BASE_SHA=""
+                fi
+              fi
+            else
+              BASE_SHA="${{ github.event.before }}"
+            fi
+
+            if [[ -z "${BASE_SHA}" ]]; then
+              DEPLOY_LIST="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+              DELETE_LIST=""
+            else
+              RAW="$(scripts/detect_stepfunctions_changes.sh "$BASE_SHA" "$HEAD_SHA" || true)"
+              DEPLOY_LIST="$(echo "$RAW" | awk -F: '$1=="DEPLOY"{print $2}' | sed '/^\s*$/d' || true)"
+              DELETE_LIST="$(echo "$RAW" | awk -F: '$1=="DELETE"{print $2}' | sed '/^\s*$/d' || true)"
+            fi
+          fi
+
+          echo "Deploy definitions:"
+          echo "$DEPLOY_LIST"
+          echo
+          echo "Delete workflow ids:"
+          echo "$DELETE_LIST"
+
+          {
+            echo "deploy<<EOF"
+            echo "$DEPLOY_LIST"
+            echo "EOF"
+            echo "delete<<EOF"
+            echo "$DELETE_LIST"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to prod
+        if: ${{ steps.changes.outputs.deploy != '' }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_EXECUTION_ROLE_ARN: ${{ secrets.SFN_EXECUTION_ROLE_ARN_PROD }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_PROD }}
+          SFN_RENDER_ENV_FILE: /tmp/sfn-render-env-prod.json
+          EVENTBRIDGE_EVENT_BUS_NAME: "default"
+          ENV_NAME: prod
+        run: |
+          set -euo pipefail
+          chmod +x scripts/deploy_sfn.sh scripts/detect_stepfunctions_changes.sh scripts/delete_sfn.sh
+          while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            scripts/deploy_sfn.sh "$ENV_NAME" "$d"
+          done <<< "${{ steps.changes.outputs.deploy }}"
+
+      - name: Delete removed workflows in prod
+        if: ${{ steps.changes.outputs.delete != '' }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_PROD }}
+          EVENTBRIDGE_EVENT_BUS_NAME: "default"
+          ENV_NAME: prod
+        run: |
+          set -euo pipefail
+          chmod +x scripts/delete_sfn.sh
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            scripts/delete_sfn.sh "$ENV_NAME" "$id"
+          done <<< "${{ steps.changes.outputs.delete }}"
+
+      - name: Update deploy checkpoint (prod)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SFN_STATE_FILE_S3_URI: ${{ secrets.SFN_STATE_FILE_S3_URI_PROD }}
+          ENV_NAME: prod
+          DEPLOY_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/update_sfn_state_checkpoint.sh
+          scripts/update_sfn_state_checkpoint.sh "$ENV_NAME" "$DEPLOY_COMMIT"
