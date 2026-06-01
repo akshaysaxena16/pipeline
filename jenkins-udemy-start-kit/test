@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  validate-json:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,9 +71,18 @@ jobs:
             done
           done <<< "$WORKFLOW_DIRS"
 
-      - name: Materialize render env (cert) from repository secret
+  validate-cert:
+    needs: [validate-json]
+    runs-on: ubuntu-latest
+    environment: cert
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize render env from GitHub Environment variables (cert)
         env:
-          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_CERT }}
+          VARS_JSON: ${{ toJson(vars) }}
         run: scripts/materialize_render_env.sh cert
 
       - name: Validate rendered bundles (cert)
@@ -81,9 +90,18 @@ jobs:
           SFN_RENDER_ENV_FILE: /tmp/sfn-render-env-cert.json
         run: scripts/validate_workflow_bundles.sh cert
 
-      - name: Materialize render env (prod) from repository secret
+  validate-prod:
+    needs: [validate-json]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize render env from GitHub Environment variables (prod)
         env:
-          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_PROD }}
+          VARS_JSON: ${{ toJson(vars) }}
         run: scripts/materialize_render_env.sh prod
 
       - name: Validate rendered bundles (prod)
@@ -96,7 +114,7 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.deploy == 'cert') ||
       (github.event_name == 'push' && github.ref_name == 'cert')
-    needs: [validate]
+    needs: [validate-cert, validate-prod]
     runs-on: ubuntu-latest
     environment: cert
     concurrency:
@@ -114,9 +132,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Materialize render env (cert) from repository secret
+      - name: Materialize render env from GitHub Environment variables (cert)
         env:
-          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_CERT }}
+          VARS_JSON: ${{ toJson(vars) }}
         run: |
           chmod +x scripts/materialize_render_env.sh
           scripts/materialize_render_env.sh cert
@@ -240,7 +258,7 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.deploy == 'prod') ||
       (github.event_name == 'push' && github.ref_name == 'prod')
-    needs: [validate]
+    needs: [validate-cert, validate-prod]
     runs-on: ubuntu-latest
     environment: prod
     concurrency:
@@ -258,9 +276,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Materialize render env (prod) from repository secret
+      - name: Materialize render env from GitHub Environment variables (prod)
         env:
-          SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_PROD }}
+          VARS_JSON: ${{ toJson(vars) }}
         run: |
           chmod +x scripts/materialize_render_env.sh
           scripts/materialize_render_env.sh prod
