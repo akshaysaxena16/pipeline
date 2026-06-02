@@ -1,78 +1,144 @@
-materialize_render_env.sh
+validate_workflow_bundles.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build render-vars JSON for ${KEY} substitution in workflow bundles.
+# Validate all workflow bundles for one deployment environment.
 #
-# Preferred (GitHub Environment variables on cert / prod):
-#   Job must set:  environment: cert   (or prod)
-#   Workflow step:
-#     env:
-#       VARS_JSON: ${{ toJson(vars) }}
-#     run: scripts/materialize_render_env.sh cert
-#
-# Legacy (single JSON repository secret) — still supported:
-#   env:
-#     SFN_RENDER_VARS_JSON: ${{ secrets.SFN_RENDER_VARS_CERT }}
-#   run: scripts/materialize_render_env.sh cert
-#
-# Output: SFN_RENDER_ENV_FILE (default /tmp/sfn-render-env-<env>.json) with ENV=<env> set.
+# Usage:
+#   SFN_RENDER_ENV_FILE=/tmp/sfn-render-env-cert.json scripts/validate_workflow_bundles.sh cert
 
 ENV_NAME="${1:-}"
+RENDER_ENV_FILE="${SFN_RENDER_ENV_FILE:-}"
 
 if [[ -z "$ENV_NAME" ]]; then
-  echo "Usage: VARS_JSON='<json>' $0 <cert|prod>" >&2
-  echo "   or: SFN_RENDER_VARS_JSON='<json>' $0 <cert|prod>" >&2
+  echo "Usage: SFN_RENDER_ENV_FILE=... $0 <cert|prod>" >&2
   exit 2
 fi
 
-OUT="${SFN_RENDER_ENV_FILE:-/tmp/sfn-render-env-${ENV_NAME}.json}"
-
-if [[ -n "${VARS_JSON:-}" ]]; then
-  printf '%s' "$VARS_JSON" | jq -e . > "${OUT}.tmp"
-elif [[ -n "${SFN_RENDER_VARS_JSON:-}" ]]; then
-  printf '%s' "$SFN_RENDER_VARS_JSON" | jq -e . > "${OUT}.tmp"
-else
-  echo "Missing VARS_JSON (from GitHub Environment variables: toJson(vars)) or SFN_RENDER_VARS_JSON" >&2
+if [[ -z "$RENDER_ENV_FILE" || ! -f "$RENDER_ENV_FILE" ]]; then
+  echo "Missing SFN_RENDER_ENV_FILE" >&2
   exit 2
 fi
 
-# GitHub Environment variables are strings; coerce JSON array/object strings for ASL.
-# Always set ENV from the deployment target (branch / workflow input), not from a variable.
-jq --arg env "$ENV_NAME" '
-  with_entries(
-    .value |= if type == "string" then
-      (. as $s | try ($s | fromjson) catch $s)
-    else
-      .
-    end
-  )
-  | . + {ENV: $env}
-' "${OUT}.tmp" > "$OUT"
-rm -f "${OUT}.tmp"
+WORKFLOW_DIRS="$(git ls-files 'stepfunctions/workflows/*/definition.asl.json' | sed 's#/definition.asl.json$##' | sort -u)"
+[[ -z "${WORKFLOW_DIRS//[[:space:]]/}" ]] && exit 0
 
-echo "Wrote render env: $OUT (ENV=$ENV_NAME, keys=$(jq 'keys | length' "$OUT"))"
+while IFS= read -r d; do
+  [[ -z "$d" ]] && continue
 
-# Warn on placeholders in git that have no value in this environment.
-if [[ -d stepfunctions/workflows ]]; then
-  mapfile -t PLACEHOLDERS < <(
-    grep -rohE '\$\{[A-Z][A-Z0-9_]*\}' stepfunctions/workflows 2>/dev/null \
-      | sed 's/^\${//;s/}$//' \
-      | grep -v '^ENV$' \
-      | sort -u \
-      || true
-  )
-  missing=()
-  for key in "${PLACEHOLDERS[@]}"; do
-    [[ -z "$key" ]] && continue
-    val="$(jq -r --arg k "$key" '.[$k] // empty' "$OUT")"
-    if [[ -z "$val" || "$val" == "null" ]]; then
-      missing+=("$key")
+  render_def="$(mktemp)"
+  render_trigger="$(mktemp)"
+  render_input="$(mktemp)"
+  render_s3="$(mktemp)"
+  render_artifacts="$(mktemp)"
+
+  python3 scripts/render_asl.py "$RENDER_ENV_FILE" "$d/definition.asl.json" "$render_def"
+  jq -e . "$render_def" >/dev/null
+
+  trigger_path="${d}/${ENV_NAME}-trigger.json"
+  if [[ -f "$trigger_path" ]]; then
+    python3 scripts/render_asl.py "$RENDER_ENV_FILE" "$trigger_path" "$render_trigger"
+    jq -e . "$render_trigger" >/dev/null
+
+    eb_enabled="$(jq -r '.eventBridge.enabled // true' "$render_trigger")"
+    if [[ "$eb_enabled" == "true" ]]; then
+      schedule_expr="$(jq -r '.eventBridge.scheduleExpression // empty' "$render_trigger")"
+      event_pattern="$(jq -c '.eventBridge.eventPattern // empty' "$render_trigger")"
+      if [[ -n "$schedule_expr" && -n "$event_pattern" ]]; then
+        echo "Trigger config in $trigger_path specifies both scheduleExpression and eventPattern" >&2
+        exit 1
+      fi
+      if [[ -z "$schedule_expr" && -z "$event_pattern" ]]; then
+        echo "Trigger config in $trigger_path must specify scheduleExpression or eventPattern when eventBridge.enabled=true" >&2
+        exit 1
+      fi
+
+      input_path="${d}/input.json"
+      [[ -f "$input_path" ]] || { echo "Missing required input file for EventBridge target in $d: expected input.json" >&2; exit 1; }
+      jq -e . "$input_path" >/dev/null
+      python3 scripts/render_asl.py "$RENDER_ENV_FILE" "$input_path" "$render_input"
+      jq -e . "$render_input" >/dev/null
     fi
-  done
-  if (( ${#missing[@]} > 0 )); then
-    echo "ERROR: GitHub Environment is missing variable(s) for placeholder(s) used in stepfunctions/workflows:" >&2
-    printf '  - %s\n' "${missing[@]}" >&2
-    exit 1
   fi
-fi
+
+  s3_file_path="${d}/s3copy.json"
+  if [[ -f "$s3_file_path" ]]; then
+    jq -e . "$s3_file_path" >/dev/null
+    python3 scripts/render_asl.py "$RENDER_ENV_FILE" "$s3_file_path" "$render_s3"
+  fi
+
+  if [[ -s "$render_s3" ]]; then
+    mapfile -t s3_tasks < <(jq -c 'if has("tasks") then .tasks[]? else . end' "$render_s3")
+    for task_json in "${s3_tasks[@]}"; do
+      s3_enabled="$(jq -r '.enabled // true' <<< "$task_json")"
+      [[ "$s3_enabled" == "true" ]] || continue
+      source_uri="$(jq -r '.sourceUri // empty' <<< "$task_json")"
+      destination_uri="$(jq -r '.destinationUri // empty' <<< "$task_json")"
+      [[ "$source_uri" == s3://* ]] || { echo "Invalid s3copy.sourceUri in $d" >&2; exit 1; }
+      [[ "$destination_uri" == s3://* ]] || { echo "Invalid s3copy.destinationUri in $d" >&2; exit 1; }
+    done
+  fi
+
+  artifact_file_path="${d}/artifacts.json"
+  if [[ -f "$artifact_file_path" ]]; then
+    jq -e . "$artifact_file_path" >/dev/null
+    python3 scripts/render_asl.py "$RENDER_ENV_FILE" "$artifact_file_path" "$render_artifacts"
+  fi
+
+  if [[ -s "$render_artifacts" ]]; then
+    mapfile -t artifact_tasks < <(jq -c 'if has("tasks") then .tasks[]? else . end' "$render_artifacts")
+    for task_json in "${artifact_tasks[@]}"; do
+      artifact_enabled="$(jq -r '.enabled // true' <<< "$task_json")"
+      [[ "$artifact_enabled" == "true" ]] || continue
+
+      artifact_mode="$(jq -r '.mode // empty' <<< "$task_json")"
+      source_sql_path="$(jq -r '.sourceSqlPath // empty' <<< "$task_json")"
+      source_file_path="$(jq -r '.sourceFilePath // empty' <<< "$task_json")"
+      destination_uri="$(jq -r '.destinationUri // empty' <<< "$task_json")"
+
+      if [[ -z "$artifact_mode" || "$artifact_mode" == "null" ]]; then
+        if [[ -n "$source_sql_path" ]]; then
+          artifact_mode="tar"
+        elif [[ -n "$source_file_path" ]]; then
+          artifact_mode="copy"
+        fi
+      fi
+
+      [[ "$destination_uri" == s3://* ]] || { echo "Invalid artifacts.destinationUri in $d" >&2; exit 1; }
+
+      resolve_artifact_path() {
+        local p="$1"
+        if [[ -f "$p" ]]; then
+          printf '%s\n' "$p"
+          return 0
+        fi
+        if [[ -f "${d}/${p}" ]]; then
+          printf '%s\n' "${d}/${p}"
+          return 0
+        fi
+        return 1
+      }
+
+      case "$artifact_mode" in
+        tar)
+          [[ -n "$source_sql_path" ]] || { echo "artifacts.mode=tar in $d requires sourceSqlPath" >&2; exit 1; }
+          [[ "$source_sql_path" != s3://* ]] || { echo "artifacts.sourceSqlPath must be a local path in $d" >&2; exit 1; }
+          resolved="$(resolve_artifact_path "$source_sql_path" || true)"
+          [[ -n "$resolved" ]] || { echo "artifacts.sourceSqlPath not found in repo: $source_sql_path ($d)" >&2; exit 1; }
+          ;;
+        copy)
+          [[ -n "$source_file_path" ]] || { echo "artifacts.mode=copy in $d requires sourceFilePath" >&2; exit 1; }
+          [[ "$source_file_path" != s3://* ]] || { echo "artifacts.sourceFilePath must be a local path in $d" >&2; exit 1; }
+          resolved="$(resolve_artifact_path "$source_file_path" || true)"
+          [[ -n "$resolved" ]] || { echo "artifacts.sourceFilePath not found in repo: $source_file_path ($d)" >&2; exit 1; }
+          ;;
+        *)
+          echo "Unsupported artifacts.mode in $d: $artifact_mode" >&2
+          exit 1
+          ;;
+      esac
+    done
+  fi
+
+  rm -f "$render_trigger" "$render_def" "$render_input" "$render_s3" "$render_artifacts"
+done <<< "$WORKFLOW_DIRS"
